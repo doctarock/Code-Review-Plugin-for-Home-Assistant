@@ -1,0 +1,34 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Local environment files
+.env
+.env.*
+*.local
+*.env.local
+
+# Mac
+.DS_Store
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# OS files
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Ignore plugin temporary/data directories
+.local-ai/
+local-ai/
