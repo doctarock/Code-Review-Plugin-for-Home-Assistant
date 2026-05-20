@@ -16,8 +16,17 @@ import {
   getCurrentBranch,
   analyzeSecurityPatterns,
   analyzeQualityPatterns,
-  buildReviewReport
+  buildReviewReport,
+  computeRiskLevel
 } from "./lib/review-domain.js";
+
+function analyzeAndReport(diff, stats) {
+  const securityFindings = analyzeSecurityPatterns(diff);
+  const qualityFindings = analyzeQualityPatterns(diff);
+  const result = buildReviewReport({ diff, stats, securityFindings, qualityFindings });
+  result.diffExcerpt = diff.length > 6000 ? diff.slice(0, 6000) + "\n[...truncated]" : diff;
+  return result;
+}
 
 export function createCodeReviewPlugin(options = {}) {
   const {
@@ -89,8 +98,8 @@ export function createCodeReviewPlugin(options = {}) {
         data: false,
         tools: TOOL_DEFINITIONS.map((t) => t.name),
         capabilities: ["code-review.analyze"],
-        hooks: ["intake:tool-call"],
-        runtimeContext: []
+        hooks: ["intake:tool-call", "queue:task-processed"],
+        runtimeContext: ["coreTransactions"]
       },
       dependencies: {
         requiredCapabilities: [],
@@ -136,29 +145,14 @@ export function createCodeReviewPlugin(options = {}) {
               filePaths: Array.isArray(args.filePaths) ? args.filePaths : []
             });
             if (!ok) throw new Error(error || "git diff failed");
-            if (!diff.trim()) {
-              result = { empty: true, message: "No diff found between the specified refs." };
-            } else {
-              const securityFindings = analyzeSecurityPatterns(diff);
-              const qualityFindings = analyzeQualityPatterns(diff);
-              result = buildReviewReport({ diff, stats, securityFindings, qualityFindings });
-              // Include a truncated diff for agent reference
-              result.diffExcerpt = diff.length > 6000 ? diff.slice(0, 6000) + "\n[...truncated]" : diff;
-            }
+            result = diff.trim() ? analyzeAndReport(diff, stats) : { empty: true, message: "No diff found between the specified refs." };
 
           } else if (name === "review_staged") {
             const cwd = String(args.cwd || "").trim();
             if (!cwd) throw new Error("cwd is required");
             const { ok, diff, stats, error } = await getStagedDiff({ cwd });
             if (!ok) throw new Error(error || "git diff --staged failed");
-            if (!diff.trim()) {
-              result = { empty: true, message: "No staged changes found." };
-            } else {
-              const securityFindings = analyzeSecurityPatterns(diff);
-              const qualityFindings = analyzeQualityPatterns(diff);
-              result = buildReviewReport({ diff, stats, securityFindings, qualityFindings });
-              result.diffExcerpt = diff.length > 6000 ? diff.slice(0, 6000) + "\n[...truncated]" : diff;
-            }
+            result = diff.trim() ? analyzeAndReport(diff, stats) : { empty: true, message: "No staged changes found." };
 
           } else if (name === "review_code_snippet") {
             const code = String(args.code || "").trim();
@@ -172,11 +166,7 @@ export function createCodeReviewPlugin(options = {}) {
                 criticalIssues: securityFindings.filter((f) => f.severity === "critical").length,
                 highIssues: securityFindings.filter((f) => f.severity === "high").length,
                 qualityWarnings: qualityFindings.filter((f) => f.severity === "warning").length,
-                riskLevel: securityFindings.some((f) => f.severity === "critical") ? "critical"
-                  : securityFindings.some((f) => f.severity === "high") ? "high"
-                  : securityFindings.some((f) => f.severity === "medium") ? "medium"
-                  : qualityFindings.some((f) => f.severity === "warning") ? "low"
-                  : "clean"
+                riskLevel: computeRiskLevel(securityFindings, qualityFindings)
               }
             };
 
@@ -197,20 +187,27 @@ export function createCodeReviewPlugin(options = {}) {
               securityFindings,
               criticalCount: securityFindings.filter((f) => f.severity === "critical").length,
               highCount: securityFindings.filter((f) => f.severity === "high").length,
-              riskLevel: securityFindings.some((f) => f.severity === "critical") ? "critical"
-                : securityFindings.some((f) => f.severity === "high") ? "high"
-                : securityFindings.some((f) => f.severity === "medium") ? "medium"
-                : "clean"
+              riskLevel: computeRiskLevel(securityFindings)
             };
 
           } else if (name === "review_get_context") {
             const cwd = String(args.cwd || "").trim();
             if (!cwd) throw new Error("cwd is required");
-            const [branch, commits] = await Promise.all([
+            const [branch, commits, diffResult] = await Promise.all([
               getCurrentBranch({ cwd }),
-              getRecentCommits({ cwd, count: Number(args.commitCount || 10) })
+              getRecentCommits({ cwd, count: Number(args.commitCount || 10) }),
+              getDiffForReview({ cwd, base: "HEAD~1", head: "HEAD" })
             ]);
-            result = { branch, recentCommits: commits };
+            result = {
+              branch,
+              recentCommits: commits,
+              pendingChanges: diffResult.ok && diffResult.diff.trim() ? {
+                filesChanged: diffResult.stats.totalFiles,
+                linesAdded: diffResult.stats.totalAdded,
+                linesRemoved: diffResult.stats.totalRemoved,
+                files: diffResult.stats.files.map((f) => f.path)
+              } : null
+            };
           }
 
           // Augment review results with autoplan blast-radius guidance when
@@ -241,6 +238,32 @@ export function createCodeReviewPlugin(options = {}) {
             result: { error: true, message: String(error?.message || error || "review error") }
           };
         }
+      });
+
+      api.addHook("queue:task-processed", async (payload = {}) => {
+        const taskId = String(payload?.taskId || "").trim();
+        const status = String(payload?.status || "").trim();
+        if (!taskId || status !== "completed") return payload;
+        const coreTransactions = api.getRuntimeContext?.()?.coreTransactions || null;
+        if (!coreTransactions) return payload;
+        try {
+          const transactions = await coreTransactions.listTransactionsForTask(taskId);
+          const applied = Array.isArray(transactions)
+            ? transactions.filter((t) => String(t.status || "").trim() === "applied")
+            : [];
+          if (applied.length >= 3) {
+            void api.broadcast?.({
+              type: "code_review.review_suggested",
+              taskId,
+              appliedCount: applied.length,
+              changedPaths: applied.slice(-8).map((t) => String(t.target?.path || "").trim()).filter(Boolean),
+              at: Date.now()
+            });
+          }
+        } catch {
+          // non-critical
+        }
+        return payload;
       });
     }
   };

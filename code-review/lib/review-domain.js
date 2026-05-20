@@ -20,7 +20,7 @@ const SECURITY_PATTERNS = [
   { id: "prototype-pollution", severity: "high", pattern: /Object\.assign\s*\([^,)]+,\s*(?:req\.|request\.|params\.|body\.)/gi, description: "Possible prototype pollution — Object.assign with user input" },
   { id: "xss-innerhtml", severity: "high", pattern: /\.innerHTML\s*=\s*[^;]*(?:req\.|request\.|params\.|body\.|query\.|\$\{)/gi, description: "Possible XSS — innerHTML set with user-controlled data" },
   { id: "path-traversal", severity: "high", pattern: /(?:readFile|readFileSync|writeFile|writeFileSync|createReadStream|createWriteStream)\s*\([^)]*(?:req\.|request\.|params\.|body\.|query\.|\.\.\/)/, description: "Possible path traversal — file operations with user input" },
-  { id: "missing-auth", severity: "medium", pattern: /app\.(?:get|post|put|delete|patch)\s*\(['"\/][^'"]+['"]\s*,\s*(?:async\s*)?\s*\([^)]*\)\s*=>/g, description: "Route registered without visible auth middleware — verify auth is applied" },
+  { id: "missing-auth", severity: "info", pattern: /app\.(?:get|post|put|delete|patch)\s*\(['"\/][^'"]+['"]\s*,\s*(?:async\s*)?\s*\([^)]*\)\s*=>/g, description: "Route registered — confirm auth middleware is applied (may be global or router-level)" },
   { id: "llm-trust-boundary", severity: "medium", pattern: /(?:response|completion|output|result)\.(?:text|content|message)\s*[;,)]/gi, description: "LLM output used directly — validate before trusting in code paths" },
   { id: "cors-wildcard", severity: "medium", pattern: /cors\s*\(\s*\{\s*origin\s*:\s*['"`]\*['"`]/gi, description: "CORS wildcard origin — restricts to specific origins in production" }
 ];
@@ -39,10 +39,10 @@ const QUALITY_PATTERNS = [
 
 async function runGit(cwd = "", args = []) {
   try {
-    const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 10 * 1024 * 1024 });
+    const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 10 * 1024 * 1024, windowsHide: true });
     return { ok: true, output: stdout };
   } catch (error) {
-    return { ok: false, output: String(error?.stdout || error?.message || "") };
+    return { ok: false, output: String(error?.stderr || error?.stdout || error?.message || "") };
   }
 }
 
@@ -115,6 +115,14 @@ function categorizeFiles(filePaths = []) {
     }
   }
   return categories;
+}
+
+export function computeRiskLevel(securityFindings = [], qualityFindings = []) {
+  if (securityFindings.some((f) => f.severity === "critical")) return "critical";
+  if (securityFindings.some((f) => f.severity === "high")) return "high";
+  if (securityFindings.some((f) => f.severity === "medium")) return "medium";
+  if (qualityFindings.some((f) => f.severity === "warning")) return "low";
+  return "clean";
 }
 
 export async function getDiffForReview({ cwd = "", base = "HEAD~1", head = "HEAD", filePaths = [] } = {}) {
